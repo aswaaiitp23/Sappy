@@ -54,6 +54,27 @@ LOGS_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOGS_DIR / "agent.jsonl"
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _clean_block(block) -> dict:
+    """
+    Convert an Anthropic SDK content block to a plain dict with only the
+    fields the API accepts when the block is re-sent in message history.
+
+    model_dump() includes internal SDK fields like `caller` on ToolUseBlock
+    and `parsed_output` on some text blocks — the API rejects these with 400.
+    We keep only the documented fields per block type.
+    """
+    raw = block.model_dump() if hasattr(block, "model_dump") else dict(block)
+    t = raw.get("type")
+    if t == "text":
+        return {"type": "text", "text": raw["text"]}
+    if t == "tool_use":
+        return {"type": "tool_use", "id": raw["id"], "name": raw["name"], "input": raw["input"]}
+    # For any other block type, keep only the safe scalar fields.
+    return {k: v for k, v in raw.items() if k in ("type", "id", "text", "name", "input")}
+
+
 # ── Observability ─────────────────────────────────────────────────────────────
 
 def log_event(event_type: str, data: dict) -> None:
@@ -64,7 +85,7 @@ def log_event(event_type: str, data: dict) -> None:
     is enough to debug and replay what the agent did.
     """
     entry = {
-        "ts": datetime.datetime.utcnow().isoformat() + "Z",
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "type": event_type,
         **data,
     }
@@ -169,6 +190,10 @@ def run_turn(session_id: str, user_input: str) -> None:
     system_prompt = build_system_prompt()
     turn_start = time.time()
 
+    # Tracks whether we've already done a BadRequestError recovery this turn.
+    # We allow one retry with a clean context; a second failure means giving up.
+    bad_request_retried = False
+
     for round_num in range(1, MAX_TOOL_ROUNDS + 1):
 
         # ── STREAMING LLM call ────────────────────────────────────────────────
@@ -213,9 +238,12 @@ def run_turn(session_id: str, user_input: str) -> None:
                                 )
                             )
 
-                # Get the final complete message after streaming finishes
+                # Get the final complete message after streaming finishes.
+                # We strip blocks down to only the fields the API accepts on
+                # re-send — model_dump() includes internal SDK fields like
+                # `caller` (ToolUseBlock) and `parsed_output` that cause 400s.
                 final = stream.get_final_message()
-                assistant_blocks = [b.model_dump() for b in final.content]
+                assistant_blocks = [_clean_block(b) for b in final.content]
                 stop_reason = final.stop_reason
 
                 call_duration = time.time() - call_start
@@ -228,9 +256,33 @@ def run_turn(session_id: str, user_input: str) -> None:
                     "duration_s": round(call_duration, 2),
                 })
 
+        except anthropic.BadRequestError as e:
+            # 400 errors almost always mean the message history contains something
+            # the API won't accept (malformed tool result, stale content block, etc.).
+            # Recovery: drop all history except the current user message and retry once.
+            log_event("api_error", {"session": session_id, "status_code": 400, "error": str(e)})
+            if not bad_request_retried:
+                console.print(
+                    "[yellow]Request error — this usually means malformed message history. "
+                    "Starting fresh context.[/yellow]"
+                )
+                messages: list[dict] = [{"role": "user", "content": user_input}]
+                bad_request_retried = True
+                continue
+            console.print("[red]Request error on retry too — giving up on this turn.[/red]")
+            break
+
         except anthropic.APIError as e:
-            log_event("llm_error", {"session": session_id, "error": str(e)})
-            console.print(f"[red]API error: {e}[/red]")
+            status = getattr(e, "status_code", None)
+            log_event("api_error", {"session": session_id, "status_code": status, "error": str(e)})
+            if status == 401:
+                console.print("[red]Invalid API key — check your .env file[/red]")
+            elif status == 429:
+                console.print("[yellow]Rate limit hit — wait a moment and try again[/yellow]")
+            elif status == 500:
+                console.print("[red]Anthropic server error — try again shortly[/red]")
+            else:
+                console.print(f"[red]API error ({status}): {e}[/red]")
             break
 
         messages.append({"role": "assistant", "content": assistant_blocks})
