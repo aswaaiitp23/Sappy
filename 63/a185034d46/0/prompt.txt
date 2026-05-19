@@ -1,0 +1,7 @@
+Write unit tests for tools.py. Create a file called test_tools.py that tests:
+1. read_file with a CSV file
+2. read_file with a missing file returns an error string
+3. list_files on the current directory
+4. dispatch_tool with an unknown tool name returns an error string
+
+Use Python's built-in unittest module, no external dependencies.
